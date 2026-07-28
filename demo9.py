@@ -2,6 +2,8 @@ import json
 import logging
 import re
 import shlex
+import os
+from dotenv import load_dotenv
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -17,55 +19,71 @@ try:
 except Exception:
     Document = None
 
+# Optional PDF support (recommended for SOP folders with PDFs)
+try:
+    from pypdf import PdfReader  # pip install pypdf
+except Exception:
+    PdfReader = None
+
+
 # =========================================================
 # 1) USER CONFIG
 # =========================================================
-API_DOC_PATH = r"C:\Users\CINT037\OneDrive - Poonawalla Fincorp Limited\Desktop\Red_team_1\VOC_Categorisation_API_Documentation"
 
-NUM_SEEDS = 4
-FOLLOWUPS_PER_SEED = 4
-MAX_TESTS = 20
-REQUEST_TIMEOUT = 60
-VERIFY_SSL = False
+load_dotenv(".env.local")
 
-# Single Azure endpoint/key/version, two models
-# AZURE_OPENAI_ENDPOINT = ""
-# AZURE_OPENAI_KEY = ""
-# AZURE_OPENAI_VERSION = ""
+API_DOC_PATH = os.getenv(
+    "API_DOC_PATH",
+    r"C:\Users\CINT037\OneDrive - Poonawalla Fincorp Limited\Desktop\Red_team_1\pai_chat",
+)
 
-# # LLM-A: prompt + expected answer generator
-# MODEL_GEN = ""
+# NEW: SOP knowledge folder (can contain many .pdf/.docx/.txt/.md/.json files)
+SOP_FOLDER_PATH = os.getenv(
+    "SOP_FOLDER_PATH",
+    r"C:\Users\CINT037\OneDrive - Poonawalla Fincorp Limited\Desktop\Red_team_1\sop",
+)
+MAX_SOP_FILES = int(os.getenv("MAX_SOP_FILES", "40"))
+MAX_SOP_CHARS = int(os.getenv("MAX_SOP_CHARS", "80000"))
 
-# # LLM-B: evaluator (expected vs actual)
-# MODEL_EVAL = ""
+NUM_SEEDS = int(os.getenv("NUM_SEEDS", "10"))
+FOLLOWUPS_PER_SEED = int(os.getenv("FOLLOWUPS_PER_SEED", "4"))
+MAX_TESTS = int(os.getenv("MAX_TESTS", "50"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
+VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() in {"1", "true", "yes"}
 
-# OUTPUT_EXCEL = "Auto_API_Test_Report_8.xlsx"
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY", "")
+AZURE_OPENAI_VERSION = os.getenv("AZURE_OPENAI_VERSION", "2024-05-01-preview")
 
-# Optional overrides when docs contain only relative path or missing auth
-API_BASE_URL_OVERRIDE = ""
-FUNCTION_KEY_OVERRIDE = ""
+MODEL_GEN = os.getenv("MODEL_GEN", "gpt-5.4")
+MODEL_EVAL = os.getenv("MODEL_EVAL", "gpt-5.5")
 
-# Default employee email to use in test queries if not provided in docs or prompts
-#DEFAULT_EMPLOYEE_EMAIL = "kriti.khare@poonawallafincorp.com"
+OUTPUT_EXCEL = os.getenv("OUTPUT_EXCEL", "Auto_API_Test_Report_7.xlsx")
+API_BASE_URL_OVERRIDE = os.getenv("API_BASE_URL_OVERRIDE", "")
+FUNCTION_KEY_OVERRIDE = os.getenv("FUNCTION_KEY_OVERRIDE", "")
+DEFAULT_EMPLOYEE_EMAIL = os.getenv(
+    "DEFAULT_EMPLOYEE_EMAIL", "kriti.khare@poonawallafincorp.com"
+)
 
-# Strict mode to avoid schema mismatch on sensitive endpoints
-STRICT_REQUEST_FROM_TEMPLATE = True
+# Optional hard auth headers as JSON string in .env.local
+# Example:
+# FORCE_AUTH_HEADERS_JSON={"Authorization":"Bearer <token>","x-functions-key":"<key>"}
+try:
+    FORCE_AUTH_HEADERS = json.loads(os.getenv("FORCE_AUTH_HEADERS_JSON", "{}"))
+    if not isinstance(FORCE_AUTH_HEADERS, dict):
+        FORCE_AUTH_HEADERS = {}
+except Exception:
+    FORCE_AUTH_HEADERS = {}
 
-# Add hard auth headers if required by endpoint
-FORCE_AUTH_HEADERS: Dict[str, str] = {
-    # "Authorization": "Bearer <token>",
-    # "x-functions-key": "<function-key>"
-}
+PRINT_RESPONSE_TEXT_ON_ERROR = os.getenv(
+    "PRINT_RESPONSE_TEXT_ON_ERROR", "true"
+).lower() in {"1", "true", "yes"}
 
-PRINT_RESPONSE_TEXT_ON_ERROR = True
 
 # =========================================================
 # 2) LOGGING + HTTP RETRY SESSION
 # =========================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 SESSION = requests.Session()
 RETRY = Retry(
@@ -74,10 +92,11 @@ RETRY = Retry(
     read=3,
     backoff_factor=1.0,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"]
+    allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
 )
 SESSION.mount("https://", HTTPAdapter(max_retries=RETRY))
 SESSION.mount("http://", HTTPAdapter(max_retries=RETRY))
+
 
 # =========================================================
 # 3) AZURE OPENAI CLIENT
@@ -91,12 +110,17 @@ def get_client() -> AzureOpenAI:
         _CLIENT = AzureOpenAI(
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             api_key=AZURE_OPENAI_KEY,
-            api_version=AZURE_OPENAI_VERSION
+            api_version=AZURE_OPENAI_VERSION,
         )
     return _CLIENT
 
 
-def llm_chat(model: str, prompt: str, system: Optional[str] = None, temperature: Optional[float] = None) -> str:
+def llm_chat(
+    model: str,
+    prompt: str,
+    system: Optional[str] = None,
+    temperature: Optional[float] = None,
+) -> str:
     try:
         client = get_client()
         messages: List[Dict[str, str]] = []
@@ -107,13 +131,22 @@ def llm_chat(model: str, prompt: str, system: Optional[str] = None, temperature:
         params: Dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "timeout": 300
+            "timeout": 300,
         }
 
         if temperature is not None:
             params["temperature"] = temperature
 
-        resp = client.chat.completions.create(**params)
+        try:
+            resp = client.chat.completions.create(**params)
+        except Exception as e:
+            err_text = str(e).lower()
+            if "temperature" in err_text and "unsupported" in err_text and "temperature" in params:
+                params.pop("temperature", None)
+                resp = client.chat.completions.create(**params)
+            else:
+                raise
+
         return (resp.choices[0].message.content or "").strip()
 
     except Exception as e:
@@ -129,6 +162,54 @@ def strip_code_fences(text: str) -> str:
     text = re.sub(r"^```(?:json|bash|sh|python|text)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
+
+def extract_message_text(payload_text: str) -> str:
+    """
+    Extract semantic message text from expected/actual JSON-like payload.
+    Falls back to raw text if JSON parsing fails.
+    """
+    if not payload_text:
+        return ""
+
+    try:
+        obj = parse_json_safely(payload_text)
+    except Exception:
+        return str(payload_text).strip()
+
+    if isinstance(obj, dict):
+        msg = obj.get("message")
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+
+        data = obj.get("data")
+        if isinstance(data, dict):
+            r = data.get("response")
+            if isinstance(r, str) and r.strip():
+                return r.strip()
+            m2 = data.get("message")
+            if isinstance(m2, str) and m2.strip():
+                return m2.strip()
+
+    return str(payload_text).strip()
+
+
+def enforce_employee_email(payload: Any, forced_email: str) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    body = dict(payload)
+    for k in ["employee_email", "email", "userEmail"]:
+        if k in body:
+            body[k] = forced_email
+            return body
+
+    body["employee_email"] = forced_email
+    return body
 
 
 def parse_json_safely(text: str) -> Any:
@@ -166,7 +247,9 @@ def sanitize_url(raw_url: str) -> str:
         vv = v.strip().strip('"').strip("'")
         vv = vv.replace("%22", "").replace("%27", "")
         clean_qs.append((k, vv))
-    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clean_qs), parts.fragment))
+    clean_url = urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(clean_qs), parts.fragment)
+    )
     clean_url = clean_url.replace("%22", "").replace("%27", "")
     return clean_url
 
@@ -176,6 +259,7 @@ def sanitize_url(raw_url: str) -> str:
 # =========================================================
 def markdownize_docx(doc: Document) -> str:
     import docx
+
     lines: List[str] = []
     for element in doc.element.body:
         if element.tag.endswith("p"):
@@ -194,6 +278,16 @@ def markdownize_docx(doc: Document) -> str:
                     lines.append("| " + " | ".join(cells) + " |")
                 lines.append("")
     return "\n".join(lines).strip()
+
+
+def read_pdf_text(path: Path) -> str:
+    if PdfReader is None:
+        raise ImportError("Install pypdf: pip install pypdf")
+    reader = PdfReader(str(path))
+    pages: List[str] = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages).strip()
 
 
 def resolve_doc_path(path_str: str) -> Path:
@@ -235,9 +329,51 @@ def load_document_text(path_str: str) -> str:
         raise ValueError("Legacy .doc is not supported directly. Convert to .docx/.md/.txt first.")
 
     if ext == ".pdf":
-        raise ValueError("PDF parsing not implemented in this script. Convert to .md/.txt/.docx first.")
+        return read_pdf_text(path)
 
-    raise ValueError(f"Unsupported file type: {ext}. Use .md/.txt/.json/.docx")
+    raise ValueError(f"Unsupported file type: {ext}. Use .md/.txt/.json/.docx/.pdf")
+
+
+def load_sop_corpus(folder_path: str, max_files: int, max_chars: int) -> Tuple[str, Dict[str, Any]]:
+    """
+    Loads many SOP files from a folder and returns combined text + diagnostics.
+    Supports .pdf/.docx/.txt/.md/.json/.yaml/.yml/.csv.
+    """
+    p = Path(folder_path).expanduser()
+    if not p.exists() or not p.is_dir():
+        return "", {
+            "sop_loaded_files": 0,
+            "sop_skipped_files": 0,
+            "sop_total_chars": 0,
+            "sop_note": f"SOP folder not found or not a directory: {p}",
+        }
+
+    exts = {".pdf", ".docx", ".txt", ".md", ".json", ".yaml", ".yml", ".csv", ".log"}
+    files = [f for f in p.rglob("*") if f.is_file() and f.suffix.lower() in exts]
+    files = sorted(files)[:max_files]
+
+    chunks: List[str] = []
+    loaded = 0
+    skipped = 0
+
+    for f in files:
+        try:
+            text = load_document_text(str(f))
+            if text.strip():
+                chunks.append(f"\n\n### SOP_SOURCE: {f.name}\n{text.strip()}")
+                loaded += 1
+        except Exception:
+            skipped += 1
+
+    combined = "\n".join(chunks).strip()
+    combined = truncate_text(combined, max_chars)
+
+    return combined, {
+        "sop_loaded_files": loaded,
+        "sop_skipped_files": skipped,
+        "sop_total_chars": len(combined),
+        "sop_note": "SOP corpus loaded",
+    }
 
 
 # =========================================================
@@ -333,7 +469,7 @@ Documentation:
     raw = llm_chat(
         model=MODEL_GEN,
         system="Extract accurate API execution details from docs. Do not hallucinate missing values.",
-        prompt=prompt
+        prompt=prompt,
     )
     data = parse_json_safely(raw)
     if not isinstance(data, dict):
@@ -352,8 +488,9 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
                 "url": c["url"],
                 "headers": c["headers"] or {"Content-Type": "application/json"},
                 "template_body": c["body"] if c["body"] is not None else {},
-                "query_fields": api_meta.get("query_field_candidates") or ["message", "query", "question", "input", "Query"],
-                "required_fields": api_meta.get("required_fields") or []
+                "query_fields": api_meta.get("query_field_candidates")
+                or ["message", "query", "question", "input", "Query"],
+                "required_fields": api_meta.get("required_fields") or [],
             }
         except Exception as e:
             logging.warning("cURL parse failed, fallback to endpoint/template: %s", e)
@@ -367,9 +504,12 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
             "method": (best.get("method") or "POST").upper(),
             "url": best.get("url") or "",
             "headers": {"Content-Type": "application/json"},
-            "template_body": api_meta.get("request_template", {}) if isinstance(api_meta.get("request_template"), (dict, list, str)) else {},
-            "query_fields": api_meta.get("query_field_candidates") or ["message", "query", "question", "input", "Query"],
-            "required_fields": api_meta.get("required_fields") or []
+            "template_body": api_meta.get("request_template", {})
+            if isinstance(api_meta.get("request_template"), (dict, list, str))
+            else {},
+            "query_fields": api_meta.get("query_field_candidates")
+            or ["message", "query", "question", "input", "Query"],
+            "required_fields": api_meta.get("required_fields") or [],
         }
 
     cfg["url"] = sanitize_url(normalize_url(cfg["url"], API_BASE_URL_OVERRIDE))
@@ -391,7 +531,9 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
 # =========================================================
 # 7) REQUEST BODY BUILDER
 # =========================================================
-def inject_prompt_into_body(template_body: Any, prompt: str, candidates: List[str], required_fields: List[str]) -> Any:
+def inject_prompt_into_body(
+    template_body: Any, prompt: str, candidates: List[str], required_fields: List[str]
+) -> Any:
     if isinstance(template_body, dict) and template_body:
         body = dict(template_body)
         lower_map = {k.lower(): k for k in body.keys()}
@@ -467,9 +609,32 @@ Return ONLY JSON:
     return [x["prompt"] for x in data if isinstance(x, dict) and "prompt" in x]
 
 
-def generate_expected_output(user_prompt: str, api_meta: Dict[str, Any]) -> str:
+def generate_expected_output(
+    user_prompt: str,
+    api_meta: Dict[str, Any],
+    doc_text: str,
+    sop_text: str,
+) -> str:
     p = f"""
-You are generating expected API behavior output.
+You are generating EXPECTED NEXT ASSISTANT BEHAVIOR (not final answer always) for the pai_chat API.
+
+Use these hard constraints from API docs and SOP corpus:
+1) Multi-turn is supported.
+2) If user asks to update/cancel/modify an existing cab booking and does not provide trip_id/booking reference,
+   expected behavior must ask for trip id/reference first.
+3) Intent/agent must stay within documented scope.
+4) Prefer clarification when required details are missing.
+5) Expected should represent the next correct assistant message, concise and actionable.
+6) SOP rules must be honored wherever they add policy/process constraints.
+
+Return ONLY valid JSON with this shape:
+{{
+  "expected_action": "direct_answer|clarification|confirmation|fallback",
+  "should_clarify": true,
+  "required_clarifications": ["..."],
+  "allowed_intents_or_agents": ["..."],
+  "message": "the expected next assistant message"
+}}
 
 API Goal:
 {api_meta.get("api_goal", "")}
@@ -477,9 +642,36 @@ API Goal:
 User Query:
 {user_prompt}
 
-Return concise expected output aligned with documentation intent.
+API Documentation (source of truth 1):
+{truncate_text(doc_text, 22000)}
+
+SOP Corpus (source of truth 2):
+{truncate_text(sop_text, 22000)}
 """
-    return llm_chat(MODEL_GEN, p, system="Generate expected outputs for API QA.", temperature=0.0).strip()
+    raw = llm_chat(
+        MODEL_GEN,
+        p,
+        system="Generate strict, contract-grounded expected next response for API QA using docs and SOP.",
+        temperature=0.0,
+    ).strip()
+
+    try:
+        obj = parse_json_safely(raw)
+        if isinstance(obj, dict):
+            return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return json.dumps(
+        {
+            "expected_action": "clarification",
+            "should_clarify": True,
+            "required_clarifications": [],
+            "allowed_intents_or_agents": [],
+            "message": raw or "Please share the required missing details so I can proceed.",
+        },
+        ensure_ascii=False,
+    )
 
 
 # =========================================================
@@ -496,6 +688,7 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
     required_fields = runtime_cfg["required_fields"]
 
     payload = inject_prompt_into_body(template_body, user_prompt, query_fields, required_fields)
+    payload = enforce_employee_email(payload, DEFAULT_EMPLOYEE_EMAIL)
 
     try:
         if method == "GET":
@@ -504,7 +697,7 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
                 headers=headers,
                 params=payload if isinstance(payload, dict) else {"Query": user_prompt},
                 timeout=REQUEST_TIMEOUT,
-                verify=VERIFY_SSL
+                verify=VERIFY_SSL,
             )
         else:
             response = SESSION.request(
@@ -513,7 +706,7 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
                 headers=headers,
                 json=payload if isinstance(payload, (dict, list)) else {"Query": user_prompt},
                 timeout=REQUEST_TIMEOUT,
-                verify=VERIFY_SSL
+                verify=VERIFY_SSL,
             )
 
         print(f"\nAPI STATUS: {response.status_code}")
@@ -534,47 +727,116 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
         return {
             "status_code": response.status_code,
             "request_body": payload,
-            "response_text": api_text
+            "response_text": api_text,
         }
 
     except requests.exceptions.RequestException as e:
         return {
             "status_code": -1,
             "request_body": payload,
-            "response_text": f"API_ERROR: {e}"
+            "response_text": f"API_ERROR: {e}",
         }
 
 
 # =========================================================
 # 10) LLM-B: EVALUATION
 # =========================================================
-def evaluate_output(expected: str, actual: str, user_prompt: str) -> str:
-    p = f"""
-Compare expected output and actual API output.
+def evaluate_output(
+    expected: str,
+    actual: str,
+    user_prompt: str,
+    api_doc_text: str,
+    sop_text: str,
+) -> Dict[str, str]:
+    expected_msg = extract_message_text(expected)
+    actual_msg = extract_message_text(actual)
 
-User Query:
+    p = f"""
+You are a semantic judge for multi-turn assistant QA.
+
+Task:
+Decide if ACTUAL is an acceptable next response to USER QUERY, considering EXPECTED as guidance (not exact text).
+
+Judgement grounding:
+- Use API Documentation and SOP Corpus as policy/process truth.
+- Reason must cite what matched or violated those references at a high level.
+
+Scoring rules:
+1) Compare intent/meaning only. Ignore wording/style/formatting/schema.
+2) Clarifying for missing required details is acceptable.
+3) Partial but relevant progress can be Yes.
+4) No only for wrong intent, contradiction, or missing core next-step.
+5) Keep reason concise and policy-relevant.
+
+USER QUERY:
 {user_prompt}
 
-Expected:
-{expected}
+EXPECTED MESSAGE (guidance):
+{expected_msg}
 
-Actual:
-{actual}
+ACTUAL MESSAGE:
+{actual_msg}
 
-Return ONLY:
-Yes
-or
-No
+API Documentation:
+{truncate_text(api_doc_text, 14000)}
 
-Yes = same core intent/meaning.
-No = wrong intent, mismatch, or unrelated result.
+SOP Corpus:
+{truncate_text(sop_text, 14000)}
+
+Return ONLY valid JSON:
+{{
+  "verdict": "Yes|No",
+  "reason": "short SOP/API-grounded reason"
+}}
 """
-    out = llm_chat(MODEL_EVAL, p).strip().lower()
-    if out == "yes":
-        return "Yes"
-    if out == "no":
-        return "No"
-    return "Evaluation Failed"
+    out = llm_chat(MODEL_EVAL, p).strip()
+
+    def normalize_verdict(raw: str) -> Optional[str]:
+        v = (raw or "").strip().lower()
+        if not v:
+            return None
+
+        yes_words = {"yes", "pass", "passed", "match", "matched", "true", "acceptable", "aligned"}
+        no_words = {"no", "fail", "failed", "mismatch", "false", "not acceptable", "not aligned"}
+
+        if v in yes_words:
+            return "Yes"
+        if v in no_words:
+            return "No"
+
+        if re.search(r"\b(yes|pass|passed|match|matched|acceptable|aligned|true)\b", v):
+            return "Yes"
+        if re.search(r"\b(no|fail|failed|mismatch|false|not\s+acceptable|not\s+aligned)\b", v):
+            return "No"
+
+        return None
+
+    try:
+        parsed = parse_json_safely(out)
+        if isinstance(parsed, dict):
+            verdict = normalize_verdict(str(parsed.get("verdict", "")))
+            if verdict is None:
+                verdict = normalize_verdict(str(parsed.get("result", "")))
+            if verdict is None:
+                verdict = normalize_verdict(str(parsed.get("label", "")))
+            if verdict is None:
+                verdict = normalize_verdict(str(parsed.get("decision", "")))
+            if verdict is None:
+                verdict = normalize_verdict(str(parsed))
+            if verdict is None:
+                verdict = "No"
+
+            reason = str(parsed.get("reason", "")).strip() or "No reason provided by evaluator."
+            return {"verdict": verdict, "reason": reason}
+    except Exception:
+        pass
+
+    verdict = normalize_verdict(out)
+    if verdict is not None:
+        reason = "Evaluator returned plain-text verdict without reason."
+        return {"verdict": verdict, "reason": reason}
+
+    return {"verdict": "Evaluation Failed", "reason": "Evaluator returned malformed output."}
 
 
 # =========================================================
@@ -588,7 +850,12 @@ def pick_topics(api_meta: Dict[str, Any]) -> List[str]:
     return ["General Functional Validation", "Error Handling", "Policy Validation"]
 
 
-def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def run_test_cycle(
+    api_meta: Dict[str, Any],
+    runtime_cfg: Dict[str, Any],
+    doc_text: str,
+    sop_text: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     topics = pick_topics(api_meta)
     all_prompts: List[str] = []
     results: List[Dict[str, Any]] = []
@@ -608,7 +875,11 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> Tup
                 raise PermissionError("401 Unauthorized during seed call. Check auth header/signature/body contract.")
 
             try:
-                fups = generate_followups(seed, seed_call["response_text"], api_meta) if FOLLOWUPS_PER_SEED > 0 else []
+                fups = (
+                    generate_followups(seed, seed_call["response_text"], api_meta)
+                    if FOLLOWUPS_PER_SEED > 0
+                    else []
+                )
             except Exception:
                 fups = []
 
@@ -624,14 +895,14 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> Tup
 
     if not all_prompts:
         raise RuntimeError(
-            "No prompts generated. Check LLM extraction/generation and API auth/config.\n" +
-            "\n".join(seed_errors[:5])
+            "No prompts generated. Check LLM extraction/generation and API auth/config.\n"
+            + "\n".join(seed_errors[:5])
         )
 
     for idx, p in enumerate(all_prompts, start=1):
         print(f"\nRunning Test Case {idx}/{len(all_prompts)}")
         try:
-            expected = generate_expected_output(p, api_meta)
+            expected = generate_expected_output(p, api_meta, doc_text, sop_text)
         except Exception as e:
             expected = f"EXPECTED_ERROR: {e}"
 
@@ -646,27 +917,40 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> Tup
             request_body = {}
 
         try:
-            verdict = evaluate_output(expected, actual, p) if status_code == 200 else "No"
+            if status_code == 200:
+                eval_result = evaluate_output(expected, actual, p, doc_text, sop_text)
+                verdict = eval_result.get("verdict", "No")
+                reason = eval_result.get("reason", "No reason provided by evaluator.")
+            else:
+                verdict = "No"
+                reason = f"API returned non-200 status code: {status_code}."
         except Exception as e:
-            verdict = f"EVAL_ERROR: {e}"
+            verdict = "Evaluation Failed"
+            reason = f"Evaluation error: {e}"
 
         worked = verdict if verdict in {"Yes", "No", "Evaluation Failed"} else "Evaluation Failed"
 
-        results.append({
-            "Test ID": idx,
-            "Prompt": p,
-            "Expected Output": expected,
-            "API Response": actual,
-            "Request Body": json.dumps(request_body, ensure_ascii=False),
-            "Comparison Result": verdict,
-            "Worked As Intended": worked
-        })
+        expected_msg = extract_message_text(expected)
+        actual_msg = extract_message_text(actual)
+
+        results.append(
+            {
+                "Test ID": idx,
+                "Prompt": p,
+                "Expected Output": expected_msg,
+                "API Response": actual_msg,
+                "Request Body": json.dumps(request_body, ensure_ascii=False),
+                "Comparison Result": verdict,
+                "Reason": reason,
+                "Worked As Intended": worked,
+            }
+        )
 
     diagnostics = {
         "seed_success_count": seed_success,
         "total_generated_prompts": len(all_prompts),
         "resolved_url": runtime_cfg["url"],
-        "resolved_method": runtime_cfg["method"]
+        "resolved_method": runtime_cfg["method"],
     }
     return results, diagnostics
 
@@ -691,13 +975,17 @@ def save_report(results: List[Dict[str, Any]], diagnostics: Dict[str, Any], out_
     print(f"Success Rate     : {success}%")
 
     df = pd.DataFrame(results)
-    summary = pd.DataFrame([{
-        "Total Tests": total,
-        "Passed": passed,
-        "Failed": failed,
-        "Evaluation Failed": eval_failed,
-        "Success Rate (%)": success
-    }])
+    summary = pd.DataFrame(
+        [
+            {
+                "Total Tests": total,
+                "Passed": passed,
+                "Failed": failed,
+                "Evaluation Failed": eval_failed,
+                "Success Rate (%)": success,
+            }
+        ]
+    )
     diag = pd.DataFrame([diagnostics])
 
     with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
@@ -727,6 +1015,21 @@ def main() -> None:
     print("\nLoading API documentation...")
     doc_text = load_document_text(API_DOC_PATH)
 
+    print("Loading SOP corpus folder...")
+    sop_text, sop_diag = load_sop_corpus(SOP_FOLDER_PATH, MAX_SOP_FILES, MAX_SOP_CHARS)
+    print(
+        json.dumps(
+            {
+                "sop_folder": SOP_FOLDER_PATH,
+                "sop_loaded_files": sop_diag.get("sop_loaded_files", 0),
+                "sop_skipped_files": sop_diag.get("sop_skipped_files", 0),
+                "sop_total_chars": sop_diag.get("sop_total_chars", 0),
+                "sop_note": sop_diag.get("sop_note", ""),
+            },
+            indent=2,
+        )
+    )
+
     print("Extracting API metadata from documentation...")
     api_meta = extract_api_config_from_doc(doc_text)
 
@@ -734,15 +1037,21 @@ def main() -> None:
     runtime_cfg = build_runtime_api_config(api_meta)
 
     print("\nResolved API config:")
-    print(json.dumps({
-        "method": runtime_cfg["method"],
-        "url": runtime_cfg["url"],
-        "headers": mask_secret_headers(runtime_cfg["headers"]),
-        "query_fields": runtime_cfg["query_fields"],
-        "required_fields": runtime_cfg["required_fields"]
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "method": runtime_cfg["method"],
+                "url": runtime_cfg["url"],
+                "headers": mask_secret_headers(runtime_cfg["headers"]),
+                "query_fields": runtime_cfg["query_fields"],
+                "required_fields": runtime_cfg["required_fields"],
+            },
+            indent=2,
+        )
+    )
 
-    results, diagnostics = run_test_cycle(api_meta, runtime_cfg)
+    results, diagnostics = run_test_cycle(api_meta, runtime_cfg, doc_text, sop_text)
+    diagnostics.update(sop_diag)
     save_report(results, diagnostics, OUTPUT_EXCEL)
 
 

@@ -19,13 +19,26 @@ try:
 except Exception:
     Document = None
 
+# Optional PDF support (recommended for SOP folders with PDFs)
+try:
+    from pypdf import PdfReader  # pip install pypdf
+except Exception:
+    PdfReader = None
+
+
 # =========================================================
 # 1) USER CONFIG
 # =========================================================
 
 load_dotenv(".env.local")
 
-API_DOC_PATH = os.getenv("API_DOC_PATH", r"C:\Users\CINT037\OneDrive - Poonawalla Fincorp Limited\Desktop\Red_team_1\pai_chat")
+# API documentation is mandatory; do not hardcode project-specific paths.
+API_DOC_PATH = os.getenv("API_DOC_PATH", "").strip()
+
+# SOP is optional. If empty/missing, evaluation is API-doc-only.
+SOP_FOLDER_PATH = os.getenv("SOP_FOLDER_PATH", "").strip()
+MAX_SOP_FILES = int(os.getenv("MAX_SOP_FILES", "40"))
+MAX_SOP_CHARS = int(os.getenv("MAX_SOP_CHARS", "80000"))
 
 NUM_SEEDS = int(os.getenv("NUM_SEEDS", "10"))
 FOLLOWUPS_PER_SEED = int(os.getenv("FOLLOWUPS_PER_SEED", "4"))
@@ -43,7 +56,7 @@ MODEL_EVAL = os.getenv("MODEL_EVAL", "gpt-5.5")
 OUTPUT_EXCEL = os.getenv("OUTPUT_EXCEL", "Auto_API_Test_Report_8.xlsx")
 API_BASE_URL_OVERRIDE = os.getenv("API_BASE_URL_OVERRIDE", "")
 FUNCTION_KEY_OVERRIDE = os.getenv("FUNCTION_KEY_OVERRIDE", "")
-DEFAULT_EMPLOYEE_EMAIL = os.getenv("DEFAULT_EMPLOYEE_EMAIL", "kriti.khare@poonawallafincorp.com")
+DEFAULT_EMPLOYEE_EMAIL = os.getenv("DEFAULT_EMPLOYEE_EMAIL", "employee@example.com")
 
 # Optional hard auth headers as JSON string in .env.local
 # Example:
@@ -59,13 +72,11 @@ PRINT_RESPONSE_TEXT_ON_ERROR = os.getenv(
     "PRINT_RESPONSE_TEXT_ON_ERROR", "true"
 ).lower() in {"1", "true", "yes"}
 
+
 # =========================================================
 # 2) LOGGING + HTTP RETRY SESSION
 # =========================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 SESSION = requests.Session()
 RETRY = Retry(
@@ -74,10 +85,11 @@ RETRY = Retry(
     read=3,
     backoff_factor=1.0,
     status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"]
+    allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
 )
 SESSION.mount("https://", HTTPAdapter(max_retries=RETRY))
 SESSION.mount("http://", HTTPAdapter(max_retries=RETRY))
+
 
 # =========================================================
 # 3) AZURE OPENAI CLIENT
@@ -91,12 +103,17 @@ def get_client() -> AzureOpenAI:
         _CLIENT = AzureOpenAI(
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             api_key=AZURE_OPENAI_KEY,
-            api_version=AZURE_OPENAI_VERSION
+            api_version=AZURE_OPENAI_VERSION,
         )
     return _CLIENT
 
 
-def llm_chat(model: str, prompt: str, system: Optional[str] = None, temperature: Optional[float] = None) -> str:
+def llm_chat(
+    model: str,
+    prompt: str,
+    system: Optional[str] = None,
+    temperature: Optional[float] = None,
+) -> str:
     try:
         client = get_client()
         messages: List[Dict[str, str]] = []
@@ -107,7 +124,7 @@ def llm_chat(model: str, prompt: str, system: Optional[str] = None, temperature:
         params: Dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "timeout": 300
+            "timeout": 300,
         }
 
         if temperature is not None:
@@ -129,6 +146,7 @@ def llm_chat(model: str, prompt: str, system: Optional[str] = None, temperature:
         logging.exception("LLM call failed: %s", e)
         return ""
 
+
 # =========================================================
 # 4) COMMON HELPERS
 # =========================================================
@@ -138,7 +156,7 @@ def strip_code_fences(text: str) -> str:
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
-# Add helper functions (for example near common helpers)
+
 def extract_message_text(payload_text: str) -> str:
     """
     Extract semantic message text from expected/actual JSON-like payload.
@@ -153,7 +171,6 @@ def extract_message_text(payload_text: str) -> str:
         return str(payload_text).strip()
 
     if isinstance(obj, dict):
-        # expected format style
         msg = obj.get("message")
         if isinstance(msg, dict):
             content = msg.get("content")
@@ -162,7 +179,6 @@ def extract_message_text(payload_text: str) -> str:
         if isinstance(msg, str) and msg.strip():
             return msg.strip()
 
-        # alternative wrapper style
         data = obj.get("data")
         if isinstance(data, dict):
             r = data.get("response")
@@ -185,7 +201,6 @@ def enforce_employee_email(payload: Any, forced_email: str) -> Any:
             body[k] = forced_email
             return body
 
-    # If none present, add canonical key
     body["employee_email"] = forced_email
     return body
 
@@ -225,7 +240,9 @@ def sanitize_url(raw_url: str) -> str:
         vv = v.strip().strip('"').strip("'")
         vv = vv.replace("%22", "").replace("%27", "")
         clean_qs.append((k, vv))
-    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clean_qs), parts.fragment))
+    clean_url = urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(clean_qs), parts.fragment)
+    )
     clean_url = clean_url.replace("%22", "").replace("%27", "")
     return clean_url
 
@@ -235,6 +252,7 @@ def sanitize_url(raw_url: str) -> str:
 # =========================================================
 def markdownize_docx(doc: Document) -> str:
     import docx
+
     lines: List[str] = []
     for element in doc.element.body:
         if element.tag.endswith("p"):
@@ -253,6 +271,16 @@ def markdownize_docx(doc: Document) -> str:
                     lines.append("| " + " | ".join(cells) + " |")
                 lines.append("")
     return "\n".join(lines).strip()
+
+
+def read_pdf_text(path: Path) -> str:
+    if PdfReader is None:
+        raise ImportError("Install pypdf: pip install pypdf")
+    reader = PdfReader(str(path))
+    pages: List[str] = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages).strip()
 
 
 def resolve_doc_path(path_str: str) -> Path:
@@ -294,9 +322,68 @@ def load_document_text(path_str: str) -> str:
         raise ValueError("Legacy .doc is not supported directly. Convert to .docx/.md/.txt first.")
 
     if ext == ".pdf":
-        raise ValueError("PDF parsing not implemented in this script. Convert to .md/.txt/.docx first.")
+        return read_pdf_text(path)
 
-    raise ValueError(f"Unsupported file type: {ext}. Use .md/.txt/.json/.docx")
+    raise ValueError(f"Unsupported file type: {ext}. Use .md/.txt/.json/.docx/.pdf")
+
+
+def load_sop_corpus(folder_path: str, max_files: int, max_chars: int) -> Tuple[str, Dict[str, Any]]:
+    """
+    Loads many SOP files from a folder and returns combined text + diagnostics.
+    If folder path is empty, SOP is considered not provided.
+    """
+    if not folder_path:
+        return "", {
+            "sop_provided": False,
+            "sop_loaded_files": 0,
+            "sop_skipped_files": 0,
+            "sop_total_chars": 0,
+            "sop_note": "SOP not provided",
+            "sop_sources": [],
+        }
+
+    p = Path(folder_path).expanduser()
+    if not p.exists() or not p.is_dir():
+        return "", {
+            "sop_provided": False,
+            "sop_loaded_files": 0,
+            "sop_skipped_files": 0,
+            "sop_total_chars": 0,
+            "sop_note": f"SOP folder missing/invalid: {p}",
+            "sop_sources": [],
+        }
+
+    exts = {".pdf", ".docx", ".txt", ".md", ".json", ".yaml", ".yml", ".csv", ".log"}
+    files = [f for f in p.rglob("*") if f.is_file() and f.suffix.lower() in exts]
+    files = sorted(files)[:max_files]
+
+    chunks: List[str] = []
+    loaded = 0
+    skipped = 0
+    source_names: List[str] = []
+
+    for f in files:
+        try:
+            text = load_document_text(str(f))
+            if text.strip():
+                chunks.append(f"\n\n### SOP_SOURCE: {f.name}\n{text.strip()}")
+                loaded += 1
+                source_names.append(f.name)
+        except Exception:
+            skipped += 1
+
+    combined = "\n".join(chunks).strip()
+    combined = truncate_text(combined, max_chars)
+
+    provided = loaded > 0
+    return combined, {
+        "sop_provided": provided,
+        "sop_loaded_files": loaded,
+        "sop_skipped_files": skipped,
+        "sop_total_chars": len(combined),
+        "sop_note": "SOP corpus loaded" if provided else "SOP provided but no readable files",
+        "sop_sources": source_names,
+    }
 
 
 # =========================================================
@@ -392,7 +479,7 @@ Documentation:
     raw = llm_chat(
         model=MODEL_GEN,
         system="Extract accurate API execution details from docs. Do not hallucinate missing values.",
-        prompt=prompt
+        prompt=prompt,
     )
     data = parse_json_safely(raw)
     if not isinstance(data, dict):
@@ -411,8 +498,9 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
                 "url": c["url"],
                 "headers": c["headers"] or {"Content-Type": "application/json"},
                 "template_body": c["body"] if c["body"] is not None else {},
-                "query_fields": api_meta.get("query_field_candidates") or ["message", "query", "question", "input", "Query"],
-                "required_fields": api_meta.get("required_fields") or []
+                "query_fields": api_meta.get("query_field_candidates")
+                or ["message", "query", "question", "input", "Query"],
+                "required_fields": api_meta.get("required_fields") or [],
             }
         except Exception as e:
             logging.warning("cURL parse failed, fallback to endpoint/template: %s", e)
@@ -426,9 +514,12 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
             "method": (best.get("method") or "POST").upper(),
             "url": best.get("url") or "",
             "headers": {"Content-Type": "application/json"},
-            "template_body": api_meta.get("request_template", {}) if isinstance(api_meta.get("request_template"), (dict, list, str)) else {},
-            "query_fields": api_meta.get("query_field_candidates") or ["message", "query", "question", "input", "Query"],
-            "required_fields": api_meta.get("required_fields") or []
+            "template_body": api_meta.get("request_template", {})
+            if isinstance(api_meta.get("request_template"), (dict, list, str))
+            else {},
+            "query_fields": api_meta.get("query_field_candidates")
+            or ["message", "query", "question", "input", "Query"],
+            "required_fields": api_meta.get("required_fields") or [],
         }
 
     cfg["url"] = sanitize_url(normalize_url(cfg["url"], API_BASE_URL_OVERRIDE))
@@ -450,7 +541,9 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
 # =========================================================
 # 7) REQUEST BODY BUILDER
 # =========================================================
-def inject_prompt_into_body(template_body: Any, prompt: str, candidates: List[str], required_fields: List[str]) -> Any:
+def inject_prompt_into_body(
+    template_body: Any, prompt: str, candidates: List[str], required_fields: List[str]
+) -> Any:
     if isinstance(template_body, dict) and template_body:
         body = dict(template_body)
         lower_map = {k.lower(): k for k in body.keys()}
@@ -478,17 +571,16 @@ def inject_prompt_into_body(template_body: Any, prompt: str, candidates: List[st
 # =========================================================
 # 8) LLM-A: PROMPT + EXPECTED OUTPUT
 # =========================================================
-def generate_seed_question(topic: str, api_meta: Dict[str, Any], doc_text: str, sop_text: str) -> str:
-    """
-    Generate one SOP-grounded user prompt.
-    """
-    p = f"""
-You are creating a realistic employee/user query for API QA.
-
-Goal:
-- Generate ONE test prompt grounded in SOP + API documentation.
-- Prompt must be answerable within documented policy/process scope.
-- Prefer scenarios where policy constraints matter (eligibility, required fields, approvals, edge cases).
+def generate_seed_question(
+    topic: str,
+    api_meta: Dict[str, Any],
+    doc_text: str,
+    sop_text: str,
+    sop_enabled: bool,
+) -> str:
+    if sop_enabled:
+        p = f"""
+Generate ONE realistic user test query grounded in SOP + API docs.
 
 Topic:
 {topic}
@@ -505,7 +597,26 @@ SOP Corpus:
 Return ONLY valid JSON:
 {{
   "prompt": "...",
-  "sop_basis": "short phrase naming SOP rule/process this prompt targets"
+  "source": "SOP:<document/process> + API_DOC"
+}}
+"""
+    else:
+        p = f"""
+Generate ONE realistic user test query grounded only in API documentation.
+
+Topic:
+{topic}
+
+API Goal:
+{api_meta.get("api_goal", "")}
+
+API Documentation:
+{truncate_text(doc_text, 18000)}
+
+Return ONLY valid JSON:
+{{
+  "prompt": "...",
+  "source": "API_DOC"
 }}
 """
     out = llm_chat(MODEL_GEN, p, temperature=0.0)
@@ -521,20 +632,17 @@ def generate_followups(
     api_meta: Dict[str, Any],
     doc_text: str,
     sop_text: str,
+    sop_enabled: bool,
 ) -> List[str]:
-    """
-    Generate SOP-grounded multi-turn follow-ups for the same scenario.
-    """
-    p = f"""
+    if sop_enabled:
+        p = f"""
 Create exactly {FOLLOWUPS_PER_SEED} follow-up test queries grounded in SOP + API docs.
 
 Requirements:
-1) Keep same conversational context as original seed query.
-2) Increase complexity gradually.
-3) Include at least one policy/process edge case from SOP.
-4) Include one clarification/required-detail style turn.
-5) Distinct wording for each follow-up.
-6) Stay within documented intent scope.
+1) Keep same conversational context.
+2) Increase complexity.
+3) Include policy/process edge cases.
+4) Keep queries in scope of documentation.
 
 API Goal:
 {api_meta.get("api_goal", "")}
@@ -553,10 +661,40 @@ SOP Corpus:
 
 Return ONLY valid JSON:
 [
-  {{"prompt":"...", "sop_basis":"..."}},
-  {{"prompt":"...", "sop_basis":"..."}},
-  {{"prompt":"...", "sop_basis":"..."}},
-  {{"prompt":"...", "sop_basis":"..."}}
+  {{"prompt":"...","source":"SOP:<rule/doc> + API_DOC"}},
+  {{"prompt":"...","source":"SOP:<rule/doc> + API_DOC"}},
+  {{"prompt":"...","source":"SOP:<rule/doc> + API_DOC"}},
+  {{"prompt":"...","source":"SOP:<rule/doc> + API_DOC"}}
+]
+"""
+    else:
+        p = f"""
+Create exactly {FOLLOWUPS_PER_SEED} follow-up test queries grounded only in API documentation.
+
+Requirements:
+1) Keep same conversational context.
+2) Increase complexity.
+3) Include one edge/error angle.
+4) Keep queries in scope of API doc.
+
+API Goal:
+{api_meta.get("api_goal", "")}
+
+Original Query:
+{seed_prompt}
+
+API Response:
+{seed_response}
+
+API Documentation:
+{truncate_text(doc_text, 18000)}
+
+Return ONLY valid JSON:
+[
+  {{"prompt":"...","source":"API_DOC"}},
+  {{"prompt":"...","source":"API_DOC"}},
+  {{"prompt":"...","source":"API_DOC"}},
+  {{"prompt":"...","source":"API_DOC"}}
 ]
 """
     out = llm_chat(MODEL_GEN, p, temperature=0.0)
@@ -567,8 +705,6 @@ Return ONLY valid JSON:
     for x in data:
         if isinstance(x, dict) and "prompt" in x and str(x["prompt"]).strip():
             prompts.append(str(x["prompt"]).strip())
-    if not prompts:
-        raise ValueError("No valid follow-up prompts generated.")
     return prompts
 
 
@@ -577,29 +713,26 @@ def generate_expected_output(
     api_meta: Dict[str, Any],
     doc_text: str,
     sop_text: str,
+    sop_enabled: bool,
 ) -> str:
-    """
-    Generate expected next assistant behavior grounded explicitly in SOP + API docs.
-    """
-    p = f"""
-You are generating EXPECTED NEXT ASSISTANT BEHAVIOR (not final answer always) for the pai_chat API.
+    if sop_enabled:
+        p = f"""
+Generate EXPECTED NEXT ASSISTANT BEHAVIOR for this API using SOP + API docs.
 
-Hard constraints:
-1) Multi-turn behavior is allowed and expected.
-2) If required details are missing, expected behavior should ask concise clarification.
-3) Stay within documented intent/agent scope.
-4) SOP policy/process constraints must be applied as primary grounding.
-5) If SOP and API docs seem inconsistent, prefer safest policy-compliant clarification.
-6) Expected should be concise, actionable, and aligned with SOP process flow.
+Constraints:
+1) Multi-turn supported.
+2) Ask clarification when required details are missing.
+3) Must follow SOP policy/process rules.
+4) Must stay within documented intent scope.
 
-Return ONLY valid JSON with this shape:
+Return ONLY valid JSON:
 {{
   "expected_action": "direct_answer|clarification|confirmation|fallback",
   "should_clarify": true,
   "required_clarifications": ["..."],
   "allowed_intents_or_agents": ["..."],
-  "sop_basis": "short SOP rule/process used",
-  "message": "the expected next assistant message"
+  "source": "SOP:<rule/doc-name> + API_DOC",
+  "message": "expected next assistant message"
 }}
 
 API Goal:
@@ -608,16 +741,44 @@ API Goal:
 User Query:
 {user_prompt}
 
-API Documentation (source of truth 1):
+API Documentation:
 {truncate_text(doc_text, 22000)}
 
-SOP Corpus (source of truth 2):
+SOP Corpus:
 {truncate_text(sop_text, 22000)}
+"""
+    else:
+        p = f"""
+Generate EXPECTED NEXT ASSISTANT BEHAVIOR for this API using API documentation only.
+
+Constraints:
+1) Multi-turn supported.
+2) Ask clarification when required details are missing.
+3) Must stay within documented API scope.
+
+Return ONLY valid JSON:
+{{
+  "expected_action": "direct_answer|clarification|confirmation|fallback",
+  "should_clarify": true,
+  "required_clarifications": ["..."],
+  "allowed_intents_or_agents": ["..."],
+  "source": "API_DOC",
+  "message": "expected next assistant message"
+}}
+
+API Goal:
+{api_meta.get("api_goal", "")}
+
+User Query:
+{user_prompt}
+
+API Documentation:
+{truncate_text(doc_text, 30000)}
 """
     raw = llm_chat(
         MODEL_GEN,
         p,
-        system="Generate strict expected next response grounded in SOP and API docs.",
+        system="Generate strict expected next response grounded in the provided sources only.",
         temperature=0.0,
     ).strip()
 
@@ -628,17 +789,19 @@ SOP Corpus (source of truth 2):
     except Exception:
         pass
 
+    fallback_source = "SOP + API_DOC" if sop_enabled else "API_DOC"
     return json.dumps(
         {
             "expected_action": "clarification",
             "should_clarify": True,
             "required_clarifications": [],
             "allowed_intents_or_agents": [],
-            "sop_basis": "Fallback: parser could not extract SOP-grounded structure",
+            "source": fallback_source,
             "message": raw or "Please share the required missing details so I can proceed.",
         },
         ensure_ascii=False,
     )
+
 
 # =========================================================
 # 9) TARGET API CALL
@@ -654,7 +817,6 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
     required_fields = runtime_cfg["required_fields"]
 
     payload = inject_prompt_into_body(template_body, user_prompt, query_fields, required_fields)
-    # Update call_target_api(...) after payload creation
     payload = enforce_employee_email(payload, DEFAULT_EMPLOYEE_EMAIL)
 
     try:
@@ -664,7 +826,7 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
                 headers=headers,
                 params=payload if isinstance(payload, dict) else {"Query": user_prompt},
                 timeout=REQUEST_TIMEOUT,
-                verify=VERIFY_SSL
+                verify=VERIFY_SSL,
             )
         else:
             response = SESSION.request(
@@ -673,7 +835,7 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
                 headers=headers,
                 json=payload if isinstance(payload, (dict, list)) else {"Query": user_prompt},
                 timeout=REQUEST_TIMEOUT,
-                verify=VERIFY_SSL
+                verify=VERIFY_SSL,
             )
 
         print(f"\nAPI STATUS: {response.status_code}")
@@ -694,23 +856,56 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
         return {
             "status_code": response.status_code,
             "request_body": payload,
-            "response_text": api_text
+            "response_text": api_text,
         }
 
     except requests.exceptions.RequestException as e:
         return {
             "status_code": -1,
             "request_body": payload,
-            "response_text": f"API_ERROR: {e}"
+            "response_text": f"API_ERROR: {e}",
         }
 
 
 # =========================================================
 # 10) LLM-B: EVALUATION
 # =========================================================
-def evaluate_output(expected: str, actual: str, user_prompt: str) -> Dict[str, str]:
+def evaluate_output(
+    expected: str,
+    actual: str,
+    user_prompt: str,
+    api_doc_text: str,
+    sop_text: str,
+    sop_enabled: bool,
+) -> Dict[str, str]:
     expected_msg = extract_message_text(expected)
     actual_msg = extract_message_text(actual)
+
+    if sop_enabled:
+        grounding_block = f"""
+Grounding:
+- Use API Documentation and SOP Corpus as truth.
+- Reason must be based on these sources.
+- Include a short source citation in "source" (e.g., SOP:file.pdf + API_DOC).
+
+API Documentation:
+{truncate_text(api_doc_text, 14000)}
+
+SOP Corpus:
+{truncate_text(sop_text, 14000)}
+"""
+        source_hint = "SOP:<doc/rule> + API_DOC"
+    else:
+        grounding_block = f"""
+Grounding:
+- Use only API Documentation as truth.
+- Reason must be based on API documentation only.
+- Source must be API_DOC.
+
+API Documentation:
+{truncate_text(api_doc_text, 22000)}
+"""
+        source_hint = "API_DOC"
 
     p = f"""
 You are a semantic judge for multi-turn assistant QA.
@@ -719,28 +914,27 @@ Task:
 Decide if ACTUAL is an acceptable next response to USER QUERY, considering EXPECTED as guidance (not exact text).
 
 Scoring rules:
-1) Compare intent/meaning only. Ignore wording, style, formatting, and JSON schema.
-2) If ACTUAL asks for missing required details, that is acceptable for multi-turn flows.
-3) If ACTUAL provides partial but relevant progress, prefer Yes unless it is contradictory or irrelevant.
-4) Return No only when:
-   - wrong intent/topic,
-   - clear contradiction,
-   - or misses the core next-step completely.
-5) Be lenient for paraphrases and valid clarifying follow-ups.
+1) Compare intent/meaning; ignore wording/style.
+2) Clarifying missing required details is acceptable.
+3) Partial but relevant progress can be Yes.
+4) Return No for wrong intent, contradiction, or missing core next-step.
 
 USER QUERY:
 {user_prompt}
 
-EXPECTED MESSAGE (guidance):
+EXPECTED MESSAGE:
 {expected_msg}
 
 ACTUAL MESSAGE:
 {actual_msg}
 
+{grounding_block}
+
 Return ONLY valid JSON:
 {{
   "verdict": "Yes|No",
-  "reason": "short reason based on semantic match/mismatch"
+  "reason": "short grounded reason",
+  "source": "{source_hint}"
 }}
 """
     out = llm_chat(MODEL_EVAL, p).strip()
@@ -749,20 +943,16 @@ Return ONLY valid JSON:
         v = (raw or "").strip().lower()
         if not v:
             return None
-
         yes_words = {"yes", "pass", "passed", "match", "matched", "true", "acceptable", "aligned"}
         no_words = {"no", "fail", "failed", "mismatch", "false", "not acceptable", "not aligned"}
-
         if v in yes_words:
             return "Yes"
         if v in no_words:
             return "No"
-
         if re.search(r"\b(yes|pass|passed|match|matched|acceptable|aligned|true)\b", v):
             return "Yes"
         if re.search(r"\b(no|fail|failed|mismatch|false|not\s+acceptable|not\s+aligned)\b", v):
             return "No"
-
         return None
 
     try:
@@ -776,22 +966,27 @@ Return ONLY valid JSON:
             if verdict is None:
                 verdict = normalize_verdict(str(parsed.get("decision", "")))
             if verdict is None:
-                verdict = normalize_verdict(str(parsed))
-            if verdict is None:
                 verdict = "No"
-
             reason = str(parsed.get("reason", "")).strip() or "No reason provided by evaluator."
-            return {"verdict": verdict, "reason": reason}
+            source = str(parsed.get("source", "")).strip() or ("SOP + API_DOC" if sop_enabled else "API_DOC")
+            return {"verdict": verdict, "reason": reason, "source": source}
     except Exception:
         pass
 
     verdict = normalize_verdict(out)
     if verdict is not None:
-        reason = "Evaluator returned plain-text verdict without reason."
-    else:
-        verdict = "No"
-        reason = "Evaluator returned malformed output; treated as semantic mismatch."
-    return {"verdict": verdict, "reason": reason}
+        return {
+            "verdict": verdict,
+            "reason": "Evaluator returned plain-text verdict without reason.",
+            "source": "SOP + API_DOC" if sop_enabled else "API_DOC",
+        }
+
+    return {
+        "verdict": "Evaluation Failed",
+        "reason": "Evaluator returned malformed output.",
+        "source": "SOP + API_DOC" if sop_enabled else "API_DOC",
+    }
+
 
 # =========================================================
 # 11) ORCHESTRATION
@@ -804,7 +999,31 @@ def pick_topics(api_meta: Dict[str, Any]) -> List[str]:
     return ["General Functional Validation", "Error Handling", "Policy Validation"]
 
 
-def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any], doc_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def extract_source_label(expected_json_text: str, eval_source: str, sop_enabled: bool) -> str:
+    """
+    Builds Source column value from expected/evaluator metadata.
+    """
+    base = "SOP + API_DOC" if sop_enabled else "API_DOC"
+    try:
+        obj = parse_json_safely(expected_json_text)
+        if isinstance(obj, dict):
+            exp_source = str(obj.get("source", "")).strip()
+            if exp_source:
+                return f"{exp_source} | Eval:{eval_source or base}"
+    except Exception:
+        pass
+    if eval_source:
+        return eval_source
+    return base
+
+
+def run_test_cycle(
+    api_meta: Dict[str, Any],
+    runtime_cfg: Dict[str, Any],
+    doc_text: str,
+    sop_text: str,
+    sop_enabled: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     topics = pick_topics(api_meta)
     all_prompts: List[str] = []
     results: List[Dict[str, Any]] = []
@@ -817,14 +1036,25 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any], doc_te
             topic = topics[i % len(topics)]
             print(f"\nSeed Group {i + 1} | Topic: {topic}")
 
-            seed = generate_seed_question(topic, api_meta, doc_text, sop_text)
+            seed = generate_seed_question(topic, api_meta, doc_text, sop_text, sop_enabled)
             seed_call = call_target_api(seed, runtime_cfg)
 
             if seed_call["status_code"] == 401:
                 raise PermissionError("401 Unauthorized during seed call. Check auth header/signature/body contract.")
 
             try:
-                fups = generate_followups(seed, seed_call["response_text"], api_meta, doc_text, sop_text) if FOLLOWUPS_PER_SEED > 0 else []
+                fups = (
+                    generate_followups(
+                        seed,
+                        seed_call["response_text"],
+                        api_meta,
+                        doc_text,
+                        sop_text,
+                        sop_enabled,
+                    )
+                    if FOLLOWUPS_PER_SEED > 0
+                    else []
+                )
             except Exception:
                 fups = []
 
@@ -840,14 +1070,14 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any], doc_te
 
     if not all_prompts:
         raise RuntimeError(
-            "No prompts generated. Check LLM extraction/generation and API auth/config.\n" +
-            "\n".join(seed_errors[:5])
+            "No prompts generated. Check LLM extraction/generation and API auth/config.\n"
+            + "\n".join(seed_errors[:5])
         )
 
     for idx, p in enumerate(all_prompts, start=1):
         print(f"\nRunning Test Case {idx}/{len(all_prompts)}")
         try:
-            expected = generate_expected_output(p, api_meta, doc_text)
+            expected = generate_expected_output(p, api_meta, doc_text, sop_text, sop_enabled)
         except Exception as e:
             expected = f"EXPECTED_ERROR: {e}"
 
@@ -861,24 +1091,28 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any], doc_te
             status_code = -1
             request_body = {}
 
+        eval_source = ""
         try:
             if status_code == 200:
-                eval_result = evaluate_output(expected, actual, p)
+                eval_result = evaluate_output(expected, actual, p, doc_text, sop_text, sop_enabled)
                 verdict = eval_result.get("verdict", "No")
                 reason = eval_result.get("reason", "No reason provided by evaluator.")
+                eval_source = eval_result.get("source", "")
             else:
                 verdict = "No"
                 reason = f"API returned non-200 status code: {status_code}."
+                eval_source = "API_RESPONSE_STATUS"
         except Exception as e:
-            verdict = "Evaluation failed"
+            verdict = "Evaluation Failed"
             reason = f"Evaluation error: {e}"
+            eval_source = "EVALUATOR_EXCEPTION"
 
         worked = verdict if verdict in {"Yes", "No", "Evaluation Failed"} else "Evaluation Failed"
 
         expected_msg = extract_message_text(expected)
         actual_msg = extract_message_text(actual)
 
-        results.append({
+        row = {
             "Test ID": idx,
             "Prompt": p,
             "Expected Output": expected_msg,
@@ -886,14 +1120,21 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any], doc_te
             "Request Body": json.dumps(request_body, ensure_ascii=False),
             "Comparison Result": verdict,
             "Reason": reason,
-            "Worked As Intended": worked
-        })
+            "Worked As Intended": worked,
+        }
+
+        # Add Source column only when SOP is provided and loaded.
+        if sop_enabled:
+            row["Source"] = extract_source_label(expected, eval_source, sop_enabled)
+
+        results.append(row)
 
     diagnostics = {
         "seed_success_count": seed_success,
         "total_generated_prompts": len(all_prompts),
         "resolved_url": runtime_cfg["url"],
-        "resolved_method": runtime_cfg["method"]
+        "resolved_method": runtime_cfg["method"],
+        "sop_enabled": sop_enabled,
     }
     return results, diagnostics
 
@@ -918,13 +1159,17 @@ def save_report(results: List[Dict[str, Any]], diagnostics: Dict[str, Any], out_
     print(f"Success Rate     : {success}%")
 
     df = pd.DataFrame(results)
-    summary = pd.DataFrame([{
-        "Total Tests": total,
-        "Passed": passed,
-        "Failed": failed,
-        "Evaluation Failed": eval_failed,
-        "Success Rate (%)": success
-    }])
+    summary = pd.DataFrame(
+        [
+            {
+                "Total Tests": total,
+                "Passed": passed,
+                "Failed": failed,
+                "Evaluation Failed": eval_failed,
+                "Success Rate (%)": success,
+            }
+        ]
+    )
     diag = pd.DataFrame([diagnostics])
 
     with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
@@ -941,7 +1186,7 @@ def save_report(results: List[Dict[str, Any]], diagnostics: Dict[str, Any], out_
 # =========================================================
 def validate_config() -> None:
     if not API_DOC_PATH:
-        raise ValueError("Set API_DOC_PATH.")
+        raise ValueError("Set API_DOC_PATH in .env.local (mandatory).")
     if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_KEY or not AZURE_OPENAI_VERSION:
         raise ValueError("Set AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_KEY / AZURE_OPENAI_VERSION.")
     if not MODEL_GEN or not MODEL_EVAL:
@@ -954,6 +1199,24 @@ def main() -> None:
     print("\nLoading API documentation...")
     doc_text = load_document_text(API_DOC_PATH)
 
+    print("Loading SOP corpus (optional)...")
+    sop_text, sop_diag = load_sop_corpus(SOP_FOLDER_PATH, MAX_SOP_FILES, MAX_SOP_CHARS)
+    sop_enabled = bool(sop_diag.get("sop_provided", False))
+
+    print(
+        json.dumps(
+            {
+                "sop_folder": SOP_FOLDER_PATH or "<not provided>",
+                "sop_enabled": sop_enabled,
+                "sop_loaded_files": sop_diag.get("sop_loaded_files", 0),
+                "sop_skipped_files": sop_diag.get("sop_skipped_files", 0),
+                "sop_total_chars": sop_diag.get("sop_total_chars", 0),
+                "sop_note": sop_diag.get("sop_note", ""),
+            },
+            indent=2,
+        )
+    )
+
     print("Extracting API metadata from documentation...")
     api_meta = extract_api_config_from_doc(doc_text)
 
@@ -961,15 +1224,27 @@ def main() -> None:
     runtime_cfg = build_runtime_api_config(api_meta)
 
     print("\nResolved API config:")
-    print(json.dumps({
-        "method": runtime_cfg["method"],
-        "url": runtime_cfg["url"],
-        "headers": mask_secret_headers(runtime_cfg["headers"]),
-        "query_fields": runtime_cfg["query_fields"],
-        "required_fields": runtime_cfg["required_fields"]
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "method": runtime_cfg["method"],
+                "url": runtime_cfg["url"],
+                "headers": mask_secret_headers(runtime_cfg["headers"]),
+                "query_fields": runtime_cfg["query_fields"],
+                "required_fields": runtime_cfg["required_fields"],
+            },
+            indent=2,
+        )
+    )
 
-    results, diagnostics = run_test_cycle(api_meta, runtime_cfg, doc_text)
+    results, diagnostics = run_test_cycle(
+        api_meta=api_meta,
+        runtime_cfg=runtime_cfg,
+        doc_text=doc_text,
+        sop_text=sop_text,
+        sop_enabled=sop_enabled,
+    )
+    diagnostics.update(sop_diag)
     save_report(results, diagnostics, OUTPUT_EXCEL)
 
 

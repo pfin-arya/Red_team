@@ -9,7 +9,7 @@ This API is the main entry point for the PAI@HR conversational assistant. It acc
 
 ### **Endpoint**
 ```
-https://pfl-aiml-prod.azurewebsites.net/api/pai_chat?code=<FUNCTION_KEY>
+https://pfl-aiml-prod.azurewebsites.net/api/pai_chat?
 ```
 
 ---
