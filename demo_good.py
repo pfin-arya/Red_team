@@ -22,28 +22,13 @@ except Exception:
 # =========================================================
 API_DOC_PATH = r"C:\Users\CINT037\OneDrive - Poonawalla Fincorp Limited\Desktop\Red_team_1\VOC_Categorisation_API_Documentation"
 
-NUM_SEEDS = 4
+NUM_SEEDS = 10
 FOLLOWUPS_PER_SEED = 4
-MAX_TESTS = 20
+MAX_TESTS = 50
 REQUEST_TIMEOUT = 60
 VERIFY_SSL = False
 
-# Single Azure endpoint/key/version, two models
-# AZURE_OPENAI_ENDPOINT = ""
-# AZURE_OPENAI_KEY = ""
-# AZURE_OPENAI_VERSION = ""
 
-# # LLM-A: prompt + expected answer generator
-# MODEL_GEN = ""
-
-# # LLM-B: evaluator (expected vs actual)
-# MODEL_EVAL = ""
-
-# OUTPUT_EXCEL = "Auto_API_Test_Report_8.xlsx"
-
-# Optional overrides when docs contain only relative path or missing auth
-API_BASE_URL_OVERRIDE = ""
-FUNCTION_KEY_OVERRIDE = ""
 
 # Default employee email to use in test queries if not provided in docs or prompts
 #DEFAULT_EMPLOYEE_EMAIL = "kriti.khare@poonawallafincorp.com"
@@ -170,6 +155,50 @@ def sanitize_url(raw_url: str) -> str:
     clean_url = clean_url.replace("%22", "").replace("%27", "")
     return clean_url
 
+def extract_vocc_urls_from_text(doc_text: str) -> List[str]:
+    pattern = r"https?://[^\s'\"`]+/api/vocc\b"
+    found = re.findall(pattern, doc_text or "", flags=re.IGNORECASE)
+    cleaned = [sanitize_url(u) for u in found]
+    # preserve order, remove duplicates
+    seen = set()
+    out: List[str] = []
+    for u in cleaned:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def choose_vocc_url(api_meta: Dict[str, Any], doc_text: str) -> str:
+    candidates: List[str] = []
+
+    curl_example = (api_meta.get("curl_example") or "").strip()
+    if curl_example:
+        try:
+            c = parse_curl(curl_example)
+            cu = sanitize_url(c.get("url") or "")
+            if "/api/vocc" in cu.lower():
+                candidates.append(cu)
+        except Exception:
+            pass
+
+    best = api_meta.get("best_endpoint", {}) if isinstance(api_meta.get("best_endpoint"), dict) else {}
+    bu = sanitize_url(best.get("url") or "")
+    if bu and "/api/vocc" in bu.lower():
+        candidates.append(bu)
+
+    candidates.extend(extract_vocc_urls_from_text(doc_text))
+
+    # absolute urls only
+    candidates = [u for u in candidates if u.startswith("http://") or u.startswith("https://")]
+    if not candidates:
+        raise ValueError("No absolute /api/vocc endpoint found in documentation.")
+
+    # prefer non-hr-transformation if multiple candidates exist (doc ambiguity resolver)
+    for u in candidates:
+        if "hr-transformation" not in u.lower():
+            return u
+    return candidates[0]
 
 # =========================================================
 # 5) DOCUMENT LOADING
@@ -341,7 +370,7 @@ Documentation:
     return data
 
 
-def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
+def build_runtime_api_config(api_meta: Dict[str, Any], doc_text: str) -> Dict[str, Any]:
     curl_cmd = (api_meta.get("curl_example") or "").strip()
 
     if curl_cmd:
@@ -372,7 +401,8 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
             "required_fields": api_meta.get("required_fields") or []
         }
 
-    cfg["url"] = sanitize_url(normalize_url(cfg["url"], API_BASE_URL_OVERRIDE))
+    resolved_vocc_url = choose_vocc_url(api_meta, doc_text)
+    cfg["url"] = sanitize_url(normalize_url(resolved_vocc_url, API_BASE_URL_OVERRIDE))
 
     if FUNCTION_KEY_OVERRIDE:
         headers = dict(cfg["headers"])
@@ -392,27 +422,38 @@ def build_runtime_api_config(api_meta: Dict[str, Any]) -> Dict[str, Any]:
 # 7) REQUEST BODY BUILDER
 # =========================================================
 def inject_prompt_into_body(template_body: Any, prompt: str, candidates: List[str], required_fields: List[str]) -> Any:
+    """
+    Only inject prompt into explicit query-like fields.
+    Never overwrite contract fields such as path/file/url/blobPath.
+    """
     if isinstance(template_body, dict) and template_body:
         body = dict(template_body)
         lower_map = {k.lower(): k for k in body.keys()}
 
+        # Only these keys are safe for NL prompt injection
+        safe_prompt_keys = {
+            "query", "question", "message", "input", "prompt", "text"
+        }
+
+        # 1) candidate keys from docs, but only if query-like
         for c in candidates:
-            key = lower_map.get(c.lower())
-            if key:
-                body[key] = prompt
+            ck = str(c).lower()
+            if ck in safe_prompt_keys and ck in lower_map:
+                body[lower_map[ck]] = prompt
                 return body
 
+        # 2) required fields from docs, but only if query-like
         for rf in required_fields:
-            key = lower_map.get(str(rf).lower())
-            if key:
-                body[key] = prompt
+            rk = str(rf).lower()
+            if rk in safe_prompt_keys and rk in lower_map:
+                body[lower_map[rk]] = prompt
                 return body
 
-        first_key = next(iter(body.keys()))
-        body[first_key] = prompt
+        # 3) if no query-like field exists, keep template untouched
         return body
 
-    key = required_fields[0] if required_fields else (candidates[0] if candidates else "Query")
+    # If no template exists, create a generic query payload
+    key = "Query"
     return {key: prompt}
 
 
@@ -544,6 +585,57 @@ def call_target_api(user_prompt: str, runtime_cfg: Dict[str, Any]) -> Dict[str, 
             "response_text": f"API_ERROR: {e}"
         }
 
+def smoke_test_vocc_from_runtime_cfg(runtime_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Single deterministic call using the exact runtime cfg.
+    Use this to validate auth/body contract before running LLM-generated cycles.
+    """
+    method = runtime_cfg["method"].upper()
+    url = runtime_cfg["url"]
+    headers = dict(runtime_cfg.get("headers", {}))
+    headers.update(FORCE_AUTH_HEADERS)
+    payload = runtime_cfg.get("template_body", {})
+
+    if not isinstance(payload, (dict, list)):
+        payload = {}
+
+    if method != "POST":
+        method = "POST"
+
+    try:
+        resp = SESSION.request(
+            method,
+            url,
+            headers=headers,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+            verify=VERIFY_SSL
+        )
+
+        print("\nSMOKE TEST")
+        print("STATUS:", resp.status_code)
+        print("URL:", url)
+        print("METHOD:", method)
+        print("HEADERS:", mask_secret_headers(headers))
+        print("BODY:", payload)
+
+        try:
+            body_text = json.dumps(resp.json(), ensure_ascii=False)
+        except Exception:
+            body_text = resp.text
+
+        print("RESPONSE:", body_text)
+
+        return {
+            "status_code": resp.status_code,
+            "response_text": body_text
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "status_code": -1,
+            "response_text": f"API_ERROR: {e}"
+        }
+
 
 # =========================================================
 # 10) LLM-B: EVALUATION
@@ -624,8 +716,8 @@ def run_test_cycle(api_meta: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> Tup
 
     if not all_prompts:
         raise RuntimeError(
-            "No prompts generated. Check LLM extraction/generation and API auth/config.\n" +
-            "\n".join(seed_errors[:5])
+            "No prompts generated. Check LLM extraction/generation and API auth/config.\n"
+            + "\n".join(seed_errors[:5])
         )
 
     for idx, p in enumerate(all_prompts, start=1):
@@ -719,6 +811,7 @@ def validate_config() -> None:
         raise ValueError("Set AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_KEY / AZURE_OPENAI_VERSION.")
     if not MODEL_GEN or not MODEL_EVAL:
         raise ValueError("Set MODEL_GEN and MODEL_EVAL.")
+    
 
 
 def main() -> None:
@@ -731,7 +824,14 @@ def main() -> None:
     api_meta = extract_api_config_from_doc(doc_text)
 
     print("Building runtime API configuration...")
-    runtime_cfg = build_runtime_api_config(api_meta)
+    runtime_cfg = build_runtime_api_config(api_meta, doc_text)
+
+    smoke = smoke_test_vocc_from_runtime_cfg(runtime_cfg)
+    if smoke["status_code"] == 401:
+        raise RuntimeError(
+            "401 Unauthorized on deterministic smoke test. "
+            "Endpoint/body are now stable; issue is auth/key scope or function auth level."
+        )
 
     print("\nResolved API config:")
     print(json.dumps({

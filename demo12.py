@@ -33,6 +33,12 @@ except Exception:
 # 1) USER CONFIG (ALL ENV-DRIVEN, NO HARDCODING)
 # =========================================================
 load_dotenv(".env.local")
+# ===================== 1) ADD NEAR USER CONFIG =====================
+# Place right after load_dotenv(".env.local")
+
+USE_CUSTOM_PROMPTS = os.getenv("USE_CUSTOM_PROMPTS", "true").lower() in {"1", "true", "yes"}
+CUSTOM_PROMPTS_FILE = os.getenv("CUSTOM_PROMPTS_FILE", "custom_prompts.txt").strip()
+
 
 API_DOC_PATH = os.getenv("API_DOC_PATH", "").strip()
 SOP_FOLDER_PATH = os.getenv("SOP_FOLDER_PATH", "").strip()
@@ -156,6 +162,29 @@ def strip_code_fences(text: str) -> str:
     text = re.sub(r"^```(?:json|bash|sh|python|text)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
+# ===================== 2) ADD NEW HELPER FUNCTION =====================
+# Place after pick_topics(...) or near other helpers
+
+def load_custom_prompts(path_str: str) -> List[str]:
+    p = Path(path_str).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Custom prompts file not found: {p}")
+
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    prompts: List[str] = []
+
+    for line in lines:
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        t = re.sub(r"^\s*[-*]\s*", "", t).strip()  # allow bullet lines
+        if t:
+            prompts.append(t)
+
+    if not prompts:
+        raise ValueError(f"No usable prompts found in: {p}")
+    return prompts
 
 
 def parse_json_safely(text: str) -> Any:
@@ -714,6 +743,66 @@ def inject_prompt_into_body(template_body: Any, prompt: str, candidates: List[st
     key = required_fields[0] if required_fields else (candidates[0] if candidates else "Query")
     return {key: prompt}
 
+# --- Add below existing helper functions (for example after inject_prompt_into_body) ---
+
+def extract_required_response_fields_from_api_doc(api_doc_text: str) -> List[str]:
+    """
+    Parse likely required response fields from API docs.
+    Uses lightweight regex heuristics to avoid changing existing metadata contract.
+    """
+    txt = (api_doc_text or "").strip()
+    if not txt:
+        return []
+
+    candidates: List[str] = []
+
+    # JSON-like key extraction (e.g., "conversation_id": ..., 'turn_id': ...)
+    for m in re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']\s*:', txt):
+        candidates.append(m)
+
+    # required fields list style (required: conversation_id, turn_id, ...)
+    req_blocks = re.findall(r"required\s*[:\-]\s*([^\n\r]+)", txt, flags=re.IGNORECASE)
+    for b in req_blocks:
+        parts = re.split(r"[,\|\s]+", b)
+        for p in parts:
+            p = p.strip().strip("`'\"")
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", p):
+                candidates.append(p)
+
+    # Keep stable order + unique values
+    seen = set()
+    out: List[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+
+    # Optional cap to avoid noisy docs
+    return out[:40]
+
+
+def find_missing_contract_fields(api_response_text: str, required_fields: List[str]) -> List[str]:
+    """
+    Checks only top-level presence in JSON response.
+    If response is not JSON/object, all required fields are considered missing.
+    """
+    if not required_fields:
+        return []
+
+    try:
+        obj = parse_json_safely(api_response_text)
+    except Exception:
+        return list(required_fields)
+
+    if not isinstance(obj, dict):
+        return list(required_fields)
+
+    missing: List[str] = []
+    for f in required_fields:
+        if f not in obj:
+            missing.append(f)
+    return missing
+
 
 # =========================================================
 # 8) LLM-A: PROMPT GENERATION ONLY
@@ -1056,48 +1145,60 @@ def run_test_cycle(
     seed_errors: List[str] = []
     seed_success = 0
 
-    # Build broad SOP hint context for generation (retrieval over API goal + topics).
-    generation_query = f"{api_meta.get('api_goal', '')} {' '.join(topics)}"
-    _, generation_sop_context = retrieve_relevant_sop_chunks(
-        query_text=generation_query,
-        sop_index=sop_index,
-        top_k=max(4, SOP_RETRIEVAL_TOP_K // 2),
-        min_score=max(0.0, SOP_RETRIEVAL_MIN_SCORE / 2.0),
-        max_context_chars=max(6000, SOP_RETRIEVAL_MAX_CONTEXT_CHARS // 2),
-    )
+    if USE_CUSTOM_PROMPTS:
+        all_prompts = load_custom_prompts(CUSTOM_PROMPTS_FILE)[:MAX_TESTS]
+        seed_success = len(all_prompts)
+        print(f"\nLoaded custom prompts: {len(all_prompts)} from {CUSTOM_PROMPTS_FILE}")
+    else:
+        # Keep existing generation flow for fallback.
+        generation_query = f"{api_meta.get('api_goal', '')} {' '.join(topics)}"
+        _, generation_sop_context = retrieve_relevant_sop_chunks(
+            query_text=generation_query,
+            sop_index=sop_index,
+            top_k=max(4, SOP_RETRIEVAL_TOP_K // 2),
+            min_score=max(0.0, SOP_RETRIEVAL_MIN_SCORE / 2.0),
+            max_context_chars=max(6000, SOP_RETRIEVAL_MAX_CONTEXT_CHARS // 2),
+        )
 
-    print(f"\nGenerating {NUM_SEEDS} seed groups...")
-    for i in range(NUM_SEEDS):
-        try:
-            topic = topics[i % len(topics)]
-            print(f"\nSeed Group {i + 1} | Topic: {topic}")
-
-            seed = generate_seed_question(topic, api_meta, doc_text, generation_sop_context)
-            seed_call = call_target_api(seed, runtime_cfg)
-
-            if seed_call["status_code"] == 401:
-                raise PermissionError("401 Unauthorized during seed call. Check auth header/signature/body contract.")
-
+        print(f"\nGenerating {NUM_SEEDS} seed groups...")
+        for i in range(NUM_SEEDS):
             try:
-                fups = (
-                    generate_followups(seed, seed_call["response_text"], api_meta, doc_text, generation_sop_context)
-                    if FOLLOWUPS_PER_SEED > 0
-                    else []
-                )
-            except Exception:
-                fups = []
+                topic = topics[i % len(topics)]
+                print(f"\nSeed Group {i + 1} | Topic: {topic}")
 
-            all_prompts.extend([seed] + fups)
-            seed_success += 1
-        except Exception as e:
-            msg = f"Seed group {i + 1} failed: {e}"
-            print(msg)
-            seed_errors.append(msg)
+                seed = generate_seed_question(topic, api_meta, doc_text, generation_sop_context)
+                seed_call = call_target_api(seed, runtime_cfg)
 
-    all_prompts = all_prompts[:MAX_TESTS]
+                if seed_call["status_code"] == 401:
+                    raise PermissionError(
+                        "401 Unauthorized during seed call. Check auth header/signature/body contract."
+                    )
+
+                try:
+                    fups = (
+                        generate_followups(seed, seed_call["response_text"], api_meta, doc_text, generation_sop_context)
+                        if FOLLOWUPS_PER_SEED > 0
+                        else []
+                    )
+                except Exception:
+                    fups = []
+
+                all_prompts.extend([seed] + fups)
+                seed_success += 1
+            except Exception as e:
+                msg = f"Seed group {i + 1} failed: {e}"
+                print(msg)
+                seed_errors.append(msg)
+
+        all_prompts = all_prompts[:MAX_TESTS]
+
     print(f"\nFinal Test Cases Count = {len(all_prompts)}")
-
     if not all_prompts:
+        if USE_CUSTOM_PROMPTS:
+            raise RuntimeError(
+                f"No prompts loaded from custom file: {CUSTOM_PROMPTS_FILE}. "
+                "Add one prompt per line."
+            )
         raise RuntimeError(
             "No prompts generated. Check LLM extraction/generation and API auth/config.\n"
             + "\n".join(seed_errors[:5])
@@ -1137,6 +1238,21 @@ def run_test_cycle(
                 verdict = eval_result.get("verdict", "Evaluation Failed")
                 reason = eval_result.get("reason", "No reason provided by evaluator.")
                 source = eval_result.get("source", format_chunk_sources(ret_chunks))
+
+                required_resp_fields = extract_required_response_fields_from_api_doc(doc_text)
+                missing_contract_fields = find_missing_contract_fields(api_response, required_resp_fields)
+
+                if missing_contract_fields:
+                    contract_note = (
+                        "Contract issue (platform/API): missing response fields: "
+                        + ", ".join(missing_contract_fields[:15])
+                    )
+                    if len(missing_contract_fields) > 15:
+                        contract_note += f" (+{len(missing_contract_fields) - 15} more)"
+
+                    reason = f"{reason} | {contract_note}" if reason else contract_note
+                    if "API_DOC_CONTRACT_CHECK" not in source:
+                        source = f"{source}, API_DOC_CONTRACT_CHECK" if source else "API_DOC_CONTRACT_CHECK"
             except Exception as e:
                 verdict = "Evaluation Failed"
                 reason = f"Evaluator exception: {e} | insufficient policy evidence"
@@ -1167,12 +1283,13 @@ def run_test_cycle(
         "resolved_url": runtime_cfg["url"],
         "resolved_method": runtime_cfg["method"],
         "evaluation_mode": "SOP_RETRIEVAL_EVIDENCE_VALIDATION",
+        "prompt_mode": "CUSTOM_FILE" if USE_CUSTOM_PROMPTS else "GENERATED",
+        "custom_prompts_file": CUSTOM_PROMPTS_FILE if USE_CUSTOM_PROMPTS else "",
         "retrieval_top_k": SOP_RETRIEVAL_TOP_K,
         "retrieval_min_score": SOP_RETRIEVAL_MIN_SCORE,
         "retrieval_max_context_chars": SOP_RETRIEVAL_MAX_CONTEXT_CHARS,
     }
     return results, diagnostics
-
 
 # =========================================================
 # 12) REPORTING
